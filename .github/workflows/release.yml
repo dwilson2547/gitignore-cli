@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+# Only one release job can run at a time.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Bump version & release
+    runs-on: ubuntu-latest
+    # Skip the run that was triggered by this workflow's own version-bump commit.
+    if: "!startsWith(github.event.head_commit.message, 'chore: bump version')"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history is needed so `git describe` works and we can push back.
+          fetch-depth: 0
+          # Use a token that is allowed to push to protected branches if needed.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # ── 1. Run tests before touching anything ──────────────────────────
+      - name: Run tests
+        run: go test -v -race -count=1 ./...
+
+      # ── 2. Read current version and compute the next minor bump ────────
+      - name: Compute next version
+        id: versions
+        run: |
+          CURRENT=$(grep -oP '(?<=AppVersion = ")v[0-9]+\.[0-9]+\.[0-9]+(?=")' internal/version/version.go)
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1 | tr -d 'v')
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          NEW_MINOR=$((MINOR + 1))
+          NEW_VERSION="v${MAJOR}.${NEW_MINOR}.0"
+          echo "current=$CURRENT"   >> "$GITHUB_OUTPUT"
+          echo "next=$NEW_VERSION"  >> "$GITHUB_OUTPUT"
+          echo "Current version : $CURRENT"
+          echo "New version     : $NEW_VERSION"
+
+      # ── 3. Write new version into version.go, commit, tag, push ───────
+      - name: Bump version in source
+        run: |
+          CURRENT="${{ steps.versions.outputs.current }}"
+          NEXT="${{ steps.versions.outputs.next }}"
+          sed -i "s/AppVersion = \"${CURRENT}\"/AppVersion = \"${NEXT}\"/" internal/version/version.go
+
+      - name: Commit and tag
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add internal/version/version.go
+          git commit -m "chore: bump version to ${NEXT}"
+          git tag "${NEXT}"
+          git push origin main
+          git push origin "${NEXT}"
+
+      # ── 4. Build release binaries ──────────────────────────────────────
+      - name: Build linux/amd64
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          LDFLAGS="-X gitignore-cli/internal/version.AppVersion=${NEXT}"
+          go build -ldflags "${LDFLAGS}" -o "gitignore-cli-linux-amd64" .
+
+      - name: Build linux/arm64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          LDFLAGS="-X gitignore-cli/internal/version.AppVersion=${NEXT}"
+          go build -ldflags "${LDFLAGS}" -o "gitignore-cli-linux-arm64" .
+
+      - name: Build darwin/arm64
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          LDFLAGS="-X gitignore-cli/internal/version.AppVersion=${NEXT}"
+          go build -ldflags "${LDFLAGS}" -o "gitignore-cli-darwin-arm64" .
+
+      - name: Build darwin/amd64
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          LDFLAGS="-X gitignore-cli/internal/version.AppVersion=${NEXT}"
+          go build -ldflags "${LDFLAGS}" -o "gitignore-cli-darwin-amd64" .
+
+      - name: Build windows/amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          LDFLAGS="-X gitignore-cli/internal/version.AppVersion=${NEXT}"
+          go build -ldflags "${LDFLAGS}" -o "gitignore-cli-windows-amd64.exe" .
+
+      - name: Build windows/arm64
+        env:
+          GOOS: windows
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          LDFLAGS="-X gitignore-cli/internal/version.AppVersion=${NEXT}"
+          go build -ldflags "${LDFLAGS}" -o "gitignore-cli-windows-arm64.exe" .
+
+      # ── 5. Generate a changelog excerpt for the release notes ──────────
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          NEXT="${{ steps.versions.outputs.next }}"
+          VERSION_NUM="${NEXT#v}"   # strip leading 'v' for the markdown header match
+          # Pull everything between the first "## [X.Y.Z]" header and the next one.
+          NOTES=$(awk "/^## \[${VERSION_NUM}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="See [CHANGELOG](CHANGELOG.md) for details."
+          fi
+          # Write to a temp file to avoid quoting issues in GITHUB_OUTPUT.
+          echo "$NOTES" > /tmp/release_notes.md
+          echo "notes_file=/tmp/release_notes.md" >> "$GITHUB_OUTPUT"
+
+      # ── 6. Create the GitHub Release ───────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.versions.outputs.next }}
+          name: ${{ steps.versions.outputs.next }}
+          body_path: ${{ steps.changelog.outputs.notes_file }}
+          files: |
+            gitignore-cli-linux-amd64
+            gitignore-cli-linux-arm64
+            gitignore-cli-darwin-arm64
+            gitignore-cli-darwin-amd64
+            gitignore-cli-windows-amd64.exe
+            gitignore-cli-windows-arm64.exe
+          fail_on_unmatched_files: true
