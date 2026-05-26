@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"gitignore-cli/internal/version"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -135,6 +138,73 @@ func writeGitignore(dir, name, content string) (appended bool, err error) {
 	}
 	_, err = f.WriteString(content)
 	return appended, err
+}
+
+// ─── Headless helpers ─────────────────────────────────────────────────────────
+
+// fetchTemplates returns the list of template names, using the cache when fresh.
+func fetchTemplates() ([]string, error) {
+	if t, ok := loadCache(); ok {
+		return t, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubAPI, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build template list request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch template list: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read template list: %w", err)
+	}
+	var entries []ghEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, fmt.Errorf("parse template list: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Type == "file" && strings.HasSuffix(e.Name, ".gitignore") {
+			names = append(names, strings.TrimSuffix(e.Name, ".gitignore"))
+		}
+	}
+	saveCache(names)
+	return names, nil
+}
+
+// fetchContent downloads a single template and returns its content.
+func fetchContent(name string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawBase+name+".gitignore", nil)
+	if err != nil {
+		return "", fmt.Errorf("build %s template request: %w", name, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s template: %w", name, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read %s template: %w", name, err)
+	}
+	return string(body), nil
+}
+
+// resolveTemplate finds the canonical template name (case-insensitive match).
+func resolveTemplate(templates []string, query string) (string, bool) {
+	q := strings.ToLower(query)
+	for _, t := range templates {
+		if strings.ToLower(t) == q {
+			return t, true
+		}
+	}
+	return "", false
 }
 
 // ─── TUI model ────────────────────────────────────────────────────────────────
@@ -344,6 +414,84 @@ func fileExists(path string) bool {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
+	args := os.Args[1:]
+
+	// --version
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "-v") {
+		fmt.Println(version.AppVersion)
+		return
+	}
+
+	// --list  →  print all available template names, one per line
+	if len(args) == 1 && args[0] == "--list" {
+		templates, err := fetchTemplates()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		for _, t := range templates {
+			fmt.Println(t)
+		}
+		return
+	}
+
+	// --quiet <Template>  →  apply template without TUI
+	if len(args) == 2 && args[0] == "--quiet" {
+		templateName := args[1]
+
+		dir, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error getting working directory:", err)
+			os.Exit(1)
+		}
+
+		templates, err := fetchTemplates()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+		canonical, ok := resolveTemplate(templates, templateName)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "error: template %q not found (run --list to see available templates)\n", templateName)
+			os.Exit(1)
+		}
+
+		content, err := fetchContent(canonical)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+		appended, err := writeGitignore(dir, canonical, content)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error writing .gitignore:", err)
+			os.Exit(1)
+		}
+
+		if appended {
+			fmt.Printf("Appended %s template to .gitignore\n", canonical)
+		} else {
+			fmt.Printf("Created .gitignore with %s template\n", canonical)
+		}
+		return
+	}
+
+	// --help / unknown flags
+	if len(args) > 0 {
+		switch args[0] {
+		case "--help", "-h":
+		default:
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n\n", args[0])
+		}
+		printUsage()
+		if args[0] == "--help" || args[0] == "-h" {
+			return
+		}
+		os.Exit(1)
+	}
+
+	// Default: launch interactive TUI
 	dir, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error getting working directory:", err)
@@ -355,4 +503,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func printUsage() {
+	fmt.Print(`Usage: gitignore [flags] 
+
+Flags:
+  (none)               Launch the interactive TUI to browse and apply a template
+  --list               Print all available template names to stdout (one per line)
+  --quiet <template>   Apply a template non-interactively (create or append .gitignore)
+  --version, -v        Print the version and exit
+  --help, -h           Print this help message and exit
+
+Examples:
+  gitignore                  # open TUI
+  gitignore --list           # list all templates
+  gitignore --quiet Python   # apply Python template without TUI
+`)
 }
